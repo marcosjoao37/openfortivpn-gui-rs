@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=openfortivpn GUI
+GenericName=Fortinet SSL VPN client
+Comment=GUI for openfortivpn
+Exec=@BIN@
+Icon=openfortivpn-gui
+Categories=Network;RemoteAccess;
+Keywords=vpn;fortinet;ssl;
+Terminal=false
+StartupNotify=true
