@@ -24,7 +24,7 @@ sudo openfortivpn vpn2.cetiqt.senai.br:10443 -u joao.araujo --trusted-cert 10ada
 | Tray | **tray-icon 0.19** with `default-features = false` (drops the `libxdo` runtime dep) + muda menus, libayatana-appindicator backend | StatusNotifierItem/DBusMenu → renders on Plasma, XFCE, GNOME w/ AppIndicator extension. GTK main loop is pumped non-blockingly from the egui update loop |
 | Serialization | serde + serde_json | profiles in JSON (user requirement) |
 | Single instance | unix socket in `$XDG_RUNTIME_DIR` | second launch sends "show" and exits |
-| Window close | Force X11 backend (XWayland) when `DISPLAY` exists; hide via `Visible(false)` | winit 0.30 Wayland backend cannot hide, restore, focus or unminimize windows (all no-ops) — under XWayland the X11 backend supports real unmap/map, so close-to-tray and tray-Open work identically on X11 and Wayland sessions. Without any X11 display: Wayland backend + minimize fallback. Event loop keeps ticking while hidden (verified via stderr heartbeat), keeping the tray menu alive |
+| Window close | Session loop: close destroys the eframe window; headless tray loop keeps the process and recreates windows on demand; backend forced to X11 (XWayland) when `DISPLAY` exists | winit 0.30 Wayland backend cannot hide/restore/focus/unminimize (all no-ops) and hides leave zombie surfaces; on X11 the loop exit closes the X connection, killing the window for real. Without any X11 display: Wayland backend + minimize fallback. Tray menu stays live both in-window and headless (verified: KWin client count 0 after close, window recreated on relay) |
 | Process mgmt | std::process + setsid/pgid | group kill of `sudo openfortivpn` |
 | Sudo password | remembered for the session in RAM (`Zeroizing`), cleared on exit or auth failure | user decision |
 | Crypto on secrets | none stored; zeroize for in-memory passwords | passwords never persisted |
@@ -133,7 +133,7 @@ Path: `$XDG_CONFIG_HOME/openfortivpn-gui/profiles.json`
 
 ## 7. Window & tray behavior
 
-- **Close (X)** → window really disappears (unmapped): the app runs on X11/XWayland when `DISPLAY` is available, where winit supports hide/restore; tray stays fully functional. Restoring: tray `Open` (or second launch). Wayland sessions without XWayland: falls back to minimize-to-taskbar. **Minimize** → normal minimize. App exits only via tray Exit (confirm when connected: "Disconnect and exit?").
+- **Close (X)** → the window is destroyed for real (session loop + X11/XWayland backend): gone from screen and taskbar; the process keeps running headless (tray menu handled by the pump loop). Restore via tray `Open`/`Connect` or a second launch. Wayland sessions without XWayland: minimize fallback instead. **Minimize** → normal minimize. App exits only via tray Exit (confirm when connected: "Disconnect and exit?").
 - System notifications (notify-rust, org.freedesktop.Notifications) fire on: connected (with interface name), manual disconnect, interface disappearance, VPN process exit, and connection failures (sudo rejection, openfortivpn exit). They are fire-and-forget (6 s timeout); failures are logged to stderr, never fatal. No notification on external-session adoption at startup.
 - Tray icon (assets/icon PNG): green overlay when connected, gray idle, yellow while connecting, red missing-binary.
 - Tray menu (dynamic):
@@ -201,13 +201,13 @@ StartupNotify=true
 - One VPN connection at a time; manual reconnect only (no auto-reconnect).
 - OTP/2FA prompts cannot be answered from GUI (no TTY); documented in About/help if hit.
 - GNOME requires the AppIndicator extension for the tray (Plasma/XFCE fine).
-- Wayland sessions: the window runs on XWayland (forced X11 backend) so close-to-tray works; if no XWayland display exists, close falls back to minimize-to-taskbar and tray `Open` cannot restore — taskbar click needed.
+- Wayland sessions: the window runs on XWayland (forced X11 backend) so close-to-tray destroys and recreates windows; tray `Open` cannot restore a merely-minimized window on raw Wayland (winit exposes no un-minimize) — taskbar click needed. Without XWayland, close falls back to minimize.
 
 ## 14. Verification checklist (every PR touching behavior)
 
 - `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` in container.
 - Unit: profiles serde roundtrip; distro detect; command assembly asserts no secret in argv.
-- Manual smoke: launch → window opens; rename openfortivpn in PATH → red banner + disabled UI; connect real profile → ppp appears, stats grow, tray Status updates; Close → X11 hidden / Wayland minimized, process alive (check `[ofg] heartbeat` on stderr — proves tray menu liveness); Disconnect kills ppp; Exit quits clean (no leftover pppd, temp config removed).
+- Manual smoke: launch → window opens; rename openfortivpn in PATH → red banner + disabled UI; connect real profile → ppp appears, stats grow, tray Status updates; Close → window destroyed (KWin client count 0), process alive in headless tray loop (`[ofg] pump` lines on stderr); tray Open/Connect recreates the window; Disconnect kills ppp; Exit quits clean (no leftover pppd, temp config removed).
 - Debug hooks: `OFG_SMOKE_CLOSE_MS=<ms>` simulates the X button after N ms (same code path as a real close) so close behavior can be tested programmatically; `[ofg +Nms]` stderr lines timestamp session transitions and a 2 s heartbeat proving the loop is alive while hidden/minimized.
 
 ## 15. Decisions (resolved 2026-09-29)

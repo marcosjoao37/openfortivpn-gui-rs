@@ -13,11 +13,16 @@ use crate::util::single_instance::InstEvent;
 use egui::ViewportCommand;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tray_icon::menu::MenuEvent;
 use zeroize::Zeroizing;
+
+/// Session end decision, shared with the main loop.
+pub const SESSION_RUNNING: u8 = 0;
+pub const SESSION_HIDE: u8 = 1;
+pub const SESSION_QUIT: u8 = 2;
 
 /// Timestamped stderr debug line (elapsed ms since process start).
 pub fn dbg_log(msg: &str) {
@@ -36,6 +41,7 @@ pub struct SharedRuntime {
     pub tray: Option<TrayApp>,
     pub events: crate::controller::EventQueue,
     pub inst_events: util::single_instance::InstQueue,
+    pub session_end: Arc<AtomicU8>,
     pub log: Arc<Mutex<VecDeque<String>>>,
     pub distro_pretty: String,
     pub distro_cmd: String,
@@ -398,6 +404,9 @@ impl OFGApp {
         if self.state.phase.busy() {
             self.on_disconnect();
         }
+        self.shared
+            .session_end
+            .store(SESSION_QUIT, Ordering::SeqCst);
         self.shared.vpn.quit();
         self.quitting = true;
         if let Some(ctx) = self.ctx.clone() {
@@ -501,28 +510,22 @@ impl eframe::App for OFGApp {
             }
         }
 
-        // Close (X): hide from screen but keep the app + VPN alive.
-        // X11: real hide (winit unmap/map works). Wayland: winit cannot hide,
-        // unmap, restore or focus a window (set_visible is a no-op,
-        // focus_window is empty, unminimize is ignored) — so we minimize to
-        // the taskbar instead; restoring is done from the taskbar.
+        // Close (X): destroy the window session, keep the process alive. Under the
+        // forced X11 backend the eframe loop exit closes the X connection, so the
+        // window really disappears (no Wayland-style lingering surface). main() then
+        // runs the headless tray loop until Open/Connect (recreates the window) or
+        // Exit (quits). The event loop keeps ticking while headless via that loop.
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.quitting {
                 dbg_log("close_requested → QUIT");
-                // No CancelClose: let eframe tear down and return.
+                // No CancelClose: let eframe tear down; main() breaks on QUIT.
             } else {
-                dbg_log(if self.on_wayland {
-                    "close_requested → minimize (Wayland)"
-                } else {
-                    "close_requested → hide to tray (X11)"
-                });
-                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-                if self.on_wayland {
-                    ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-                } else {
-                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-                }
-                self.push_log("Window hidden — openfortivpn-gui keeps running in the tray.".into());
+                dbg_log("close_requested → HIDE (window session destroyed)");
+                self.shared
+                    .session_end
+                    .store(SESSION_HIDE, Ordering::SeqCst);
+                self.stats_stop.store(true, Ordering::SeqCst);
+                self.push_log("Window closed — openfortivpn-gui keeps running in the tray.".into());
             }
         }
 
