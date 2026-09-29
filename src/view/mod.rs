@@ -241,6 +241,7 @@ impl OFGApp {
 
     fn drain_tray(&mut self) {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            dbg_log(&format!("tray menu event: {}", ev.id().0));
             match ev.id().0.as_str() {
                 "open" => self.show_window(),
                 "toggle" => self.tray_toggle(),

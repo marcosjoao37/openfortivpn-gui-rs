@@ -19,6 +19,23 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     };
 
+    // Window backend: prefer X11 (XWayland) even under a Wayland session.
+    // winit's Wayland backend cannot hide, restore or focus windows (all
+    // no-ops), which breaks close-to-tray; the X11 backend supports real
+    // unmap/map. Without any X11 display we stay on Wayland and degrade to
+    // minimize-on-close (see view::OFGApp close handling).
+    let has_x11 =
+        std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
+    if has_x11 {
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("WAYLAND_SOCKET");
+    }
+    openfortivpn_gui::view::dbg_log(if has_x11 {
+        "window backend: X11/XWayland — close hides to tray"
+    } else {
+        "window backend: Wayland — close minimizes (no X11 display)"
+    });
+
     let gtk_ok = gtk::init().is_ok();
     let tray = tray::init(gtk_ok).ok();
 

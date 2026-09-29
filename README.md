@@ -23,7 +23,7 @@ Linux desktop GUI for [`openfortivpn`](https://github.com/adrienverge/openfortiv
 | Missing binary | Red banner, all fields + Connect disabled, distro-specific install command (`pacman/apt/dnf/zypper/apk/emerge`) with Copy button |
 | Certificate trust | Per-profile SHA-256 `--trusted-cert`; unknown-cert fingerprints are parsed from openfortivpn output and offered via "Trust this certificate" |
 | Tray | Open, Connect⇄Disconnect (dynamic), Status (live ↓↑ MB + KB/s), Exit (confirm when connected). Color-coded icon: gray idle / yellow connecting / green connected / red error |
-| Window | Close (X) → out of sight, app keeps running in tray (X11: hidden to tray; Wayland: minimized to taskbar — winit cannot unmap Wayland windows, restore from taskbar). Minimize → taskbar. Single instance (second launch focuses the first) |
+| Window | Close (X) → window really closes, app keeps running in tray; tray `Open` brings it back. Runs on XWayland when available (works on Wayland sessions); without X11 it falls back to minimize-on-close. Minimize → taskbar. Single instance (second launch focuses the first) |
 | Stats | Session totals in MB + down/up rates in KB/s, sampled 1 Hz from `/sys/class/net/ppp*/tun*` |
 | External sessions | An openfortivpn started in a terminal is adopted at startup (shown connected, can be disconnected) |
 | Notifications | Desktop notifications on connect, disconnect, and failures |
