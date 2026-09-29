@@ -127,6 +127,7 @@ Path: `$XDG_CONFIG_HOME/openfortivpn-gui/profiles.json`
 ```
 
 - Red banner state: openfortivpn missing → ALL fields + Connect disabled. Banner includes detected-distro install command + Copy button (§9 table) and the sudoers nano tip.
+- **In-window icons must be drawn as egui painter shapes** (`status_dot`, `arrow`, `warn_icon` in view/main_window.rs) — egui's default fonts (Ubuntu-Light, NotoEmoji) lack ↓/↑/●/⚠ and render them as empty squares. Tray-menu text is Plasma-rendered with system fonts and may use Unicode freely.
 - Main screen shows field values read-only (dropdown switches profile); editing happens only in the ✎ modal. Profile switching is **disabled while a session is active** (no mid-session switch).
 - Modal editor: name, server, username, trust checkbox + cert hash, optional interface override; Delete button (confirm dialog), Save/Cancel.
 - Disable matrix: while Connecting/Connected → server/user/cert/trust and profile dropdown disabled; password editable only when Idle/Failed.
