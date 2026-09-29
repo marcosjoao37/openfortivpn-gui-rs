@@ -1,8 +1,7 @@
-use crate::controller::vpn::UiEvent;
+use crate::controller::vpn::{push_event, EventQueue, UiEvent};
 use crate::model::state::{ConnPhase, Stats};
 use crate::util;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,23 +12,26 @@ use std::time::{Duration, Instant};
 pub fn spawn(
     interface_override: Option<String>,
     existing: Option<String>,
-    evt: Sender<UiEvent>,
+    events: EventQueue,
     stop: Arc<AtomicBool>,
 ) {
-    std::thread::spawn(move || run(interface_override, existing, evt, stop));
+    std::thread::spawn(move || run(interface_override, existing, events, stop));
 }
 
 fn run(
     override_iface: Option<String>,
     existing: Option<String>,
-    evt: Sender<UiEvent>,
+    events: EventQueue,
     stop: Arc<AtomicBool>,
 ) {
     let iface = match existing {
         Some(i) => i,
-        None => match wait_for_iface(override_iface, &evt, &stop) {
+        None => match wait_for_iface(override_iface, &events, &stop) {
             Some(i) => {
-                let _ = evt.send(UiEvent::Phase(ConnPhase::Connected { iface: i.clone() }));
+                push_event(
+                    &events,
+                    UiEvent::Phase(ConnPhase::Connected { iface: i.clone() }),
+                );
                 i
             }
             None => return, // timeout event already sent
@@ -37,7 +39,7 @@ fn run(
     };
 
     let Some(base) = util::iface_bytes(&iface) else {
-        let _ = evt.send(UiEvent::IfaceGone);
+        push_event(&events, UiEvent::IfaceGone);
         return;
     };
     let mut prev = base;
@@ -46,6 +48,7 @@ fn run(
         if stop.load(Ordering::SeqCst) {
             return;
         }
+        // 1 s window: ten 100 ms slices so stop requests are honored promptly.
         for _ in 0..10 {
             if stop.load(Ordering::SeqCst) {
                 return;
@@ -53,30 +56,33 @@ fn run(
             std::thread::sleep(Duration::from_millis(100));
         }
         let Some(now) = util::iface_bytes(&iface) else {
-            let _ = evt.send(UiEvent::IfaceGone);
+            push_event(&events, UiEvent::IfaceGone);
             return;
         };
         let rx_total = now.0.saturating_sub(base.0);
         let tx_total = now.1.saturating_sub(base.1);
-        let rx_rate = now.0.saturating_sub(prev.0) as f64; // 1 s window
+        let rx_rate = now.0.saturating_sub(prev.0) as f64; // bytes in the 1 s window
         let tx_rate = now.1.saturating_sub(prev.1) as f64;
         prev = now;
-        let _ = evt.send(UiEvent::Stats {
-            stats: Stats {
-                rx_bytes: rx_total,
-                tx_bytes: tx_total,
-                rx_kbps: rx_rate / 1024.0,
-                tx_kbps: tx_rate / 1024.0,
+        push_event(
+            &events,
+            UiEvent::Stats {
+                stats: Stats {
+                    rx_bytes: rx_total,
+                    tx_bytes: tx_total,
+                    rx_kbps: rx_rate / 1024.0,
+                    tx_kbps: tx_rate / 1024.0,
+                },
+                iface: iface.clone(),
             },
-            iface: iface.clone(),
-        });
+        );
     }
 }
 
 /// Poll up to 120 s for a ppp*/tun* interface that did not exist at spawn time.
 fn wait_for_iface(
     override_iface: Option<String>,
-    evt: &Sender<UiEvent>,
+    events: &EventQueue,
     stop: &Arc<AtomicBool>,
 ) -> Option<String> {
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -88,9 +94,10 @@ fn wait_for_iface(
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        let _ = evt.send(UiEvent::ConnectFailed(format!(
-            "interface '{name}' did not appear within 120 s."
-        )));
+        push_event(
+            events,
+            UiEvent::ConnectFailed(format!("interface '{name}' did not appear within 120 s.")),
+        );
         return None;
     }
     let baseline: std::collections::HashSet<String> = util::net_ifaces().into_iter().collect();
@@ -104,9 +111,10 @@ fn wait_for_iface(
         std::thread::sleep(Duration::from_millis(500));
     }
     if !stop.load(Ordering::SeqCst) {
-        let _ = evt.send(UiEvent::ConnectFailed(
-            "no VPN interface (ppp*/tun*) appeared within 120 s.".into(),
-        ));
+        push_event(
+            events,
+            UiEvent::ConnectFailed("no VPN interface (ppp*/tun*) appeared within 120 s.".into()),
+        );
     }
     None
 }

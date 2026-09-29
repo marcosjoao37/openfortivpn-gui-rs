@@ -8,6 +8,53 @@ const RED_BG: Color32 = Color32::from_rgb(0xB3, 0x26, 0x1E);
 const AMBER_BG: Color32 = Color32::from_rgb(0x8A, 0x62, 0x00);
 const WHITE: Color32 = Color32::WHITE;
 const ERR_FG: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
+const DOWN_BLUE: Color32 = Color32::from_rgb(0x4F, 0x9C, 0xF5);
+const UP_GREEN: Color32 = Color32::from_rgb(0x34, 0xC0, 0x7C);
+
+// egui's default fonts lack ↓/↑/●/⚠ glyphs (they render as empty squares),
+// so in-window icons are drawn as shapes. Tray-menu text is rendered by
+// Plasma with system fonts and may use Unicode freely.
+
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.0, color);
+}
+
+/// Filled triangle pointing along `dir` (e.g. (0,1) = down).
+fn arrow(ui: &mut egui::Ui, dir: egui::Vec2, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 16.0), egui::Sense::hover());
+    let c = rect.center();
+    let tip = c + dir * 6.0;
+    let back = c - dir * 4.0;
+    let perp = egui::vec2(-dir.y, dir.x) * 4.5;
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![tip, back + perp, back - perp],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// Warning triangle with a "!" (banner glyph replacement for ⚠).
+fn warn_icon(ui: &mut egui::Ui, size: f32, fill: Color32, glyph: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let (x, bottom) = (rect.left(), rect.bottom());
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(x + size * 0.5, bottom - size),
+            egui::pos2(x + size, bottom),
+            egui::pos2(x, bottom),
+        ],
+        fill,
+        egui::Stroke::NONE,
+    ));
+    ui.painter().text(
+        egui::pos2(x + size * 0.5, bottom - size * 0.34),
+        egui::Align2::CENTER_CENTER,
+        "!",
+        egui::FontId::proportional(size * 0.55),
+        glyph,
+    );
+}
 
 pub fn draw(app: &mut OFGApp, ctx: &egui::Context) {
     footer_panel(app, ctx);
@@ -42,7 +89,7 @@ fn banner(ui: &mut egui::Ui, app: &mut OFGApp) {
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("⚠").size(22.0).color(WHITE));
+                    warn_icon(ui, 24.0, WHITE, RED_BG);
                     ui.vertical(|ui| {
                         ui.label(
                             RichText::new("openfortivpn is not installed")
@@ -50,10 +97,10 @@ fn banner(ui: &mut egui::Ui, app: &mut OFGApp) {
                                 .color(WHITE),
                         );
                         ui.label(
-                            RichText::new(format!("Detected distro: {}", app.distro_pretty))
+                            RichText::new(format!("Detected distro: {}", app.shared.distro_pretty))
                                 .color(WHITE),
                         );
-                        copy_row(ui, "Install command", app.distro_cmd.clone());
+                        copy_row(ui, "Install command", app.shared.distro_cmd.clone());
                         ui.add_space(4.0);
                         sudoers_tip(ui, app, WHITE);
                     });
@@ -95,9 +142,9 @@ fn banner(ui: &mut egui::Ui, app: &mut OFGApp) {
                             prof.trust_cert = true;
                             prof.trusted_cert = sha.to_lowercase();
                             app.book.upsert(prof);
-                            app.book.save(&app.paths.book_path).ok();
+                            app.book.save(&app.shared.paths.book_path).ok();
                             app.state.unknown_cert = None;
-                            app.state.push_log(
+                            app.push_log(
                                 "Certificate trusted and saved to the profile. Reconnect to apply."
                                     .into(),
                             );
@@ -160,7 +207,7 @@ fn profile_bar(ui: &mut egui::Ui, app: &mut OFGApp) {
                 });
             if sel != app.book.selected {
                 app.book.selected = sel;
-                app.book.save(&app.paths.book_path).ok();
+                app.book.save(&app.shared.paths.book_path).ok();
             }
         } else {
             let mut cur = current;
@@ -191,7 +238,7 @@ fn profile_bar(ui: &mut egui::Ui, app: &mut OFGApp) {
             }
         }
         if ui
-            .button("↻")
+            .button("Re-check")
             .on_hover_text("Re-check installation and sudoers")
             .clicked()
         {
@@ -222,12 +269,15 @@ fn fields(ui: &mut egui::Ui, app: &mut OFGApp) {
             ui.end_row();
 
             ui.label("VPN password:");
-            ui.add_enabled(
+            let resp = ui.add_enabled(
                 can_edit_password,
                 TextEdit::singleline(&mut app.vpn_pass)
                     .password(true)
                     .desired_width(340.0),
             );
+            if resp.changed() && !app.vpn_pass.is_empty() {
+                app.connect_hint = None;
+            }
             ui.end_row();
 
             ui.label("Trust certificate:");
@@ -254,9 +304,10 @@ fn fields(ui: &mut egui::Ui, app: &mut OFGApp) {
 
 fn action_row(ui: &mut egui::Ui, app: &mut OFGApp) {
     ui.horizontal(|ui| {
+        // Connect stays enabled even with an empty password; clicking it
+        // shows an inline hint instead of silently doing nothing.
         let can_connect = app.state.installed
             && matches!(app.state.phase, ConnPhase::Idle | ConnPhase::Failed { .. })
-            && !app.vpn_pass.is_empty()
             && app.book.selected_profile().is_some();
         let can_disconnect = app.state.phase.busy();
         if ui
@@ -274,34 +325,31 @@ fn action_row(ui: &mut egui::Ui, app: &mut OFGApp) {
         {
             app.on_disconnect();
         }
-        let (dot, txt, color) = phase_indicator(&app.state.phase);
-        ui.label(RichText::new(dot).size(14.0).color(color));
+        let (txt, color) = phase_indicator(&app.state.phase);
+        status_dot(ui, color);
         ui.label(txt);
     });
+    if let Some(hint) = &app.connect_hint {
+        ui.label(RichText::new(hint).color(ERR_FG));
+    }
     if let ConnPhase::Failed { reason } = &app.state.phase {
         ui.label(RichText::new(reason).color(ERR_FG));
     }
 }
 
-fn phase_indicator(phase: &ConnPhase) -> (&'static str, String, Color32) {
+fn phase_indicator(phase: &ConnPhase) -> (String, Color32) {
     match phase {
-        ConnPhase::Idle => ("●", "Idle".into(), Color32::GRAY),
-        ConnPhase::Connecting => (
-            "●",
-            "Connecting…".into(),
-            Color32::from_rgb(0xF5, 0x9E, 0x0B),
-        ),
+        ConnPhase::Idle => ("Idle".into(), Color32::GRAY),
+        ConnPhase::Connecting => ("Connecting…".into(), Color32::from_rgb(0xF5, 0x9E, 0x0B)),
         ConnPhase::Connected { iface } => (
-            "●",
             format!("Connected ({iface})"),
             Color32::from_rgb(0x22, 0xC5, 0x5E),
         ),
         ConnPhase::External { pid, iface } => (
-            "●",
             format!("Connected ({iface}, external pid {pid})"),
             Color32::from_rgb(0x22, 0xC5, 0x5E),
         ),
-        ConnPhase::Failed { .. } => ("●", "Failed".into(), Color32::from_rgb(0xDC, 0x26, 0x26)),
+        ConnPhase::Failed { .. } => ("Failed".into(), Color32::from_rgb(0xDC, 0x26, 0x26)),
     }
 }
 
@@ -313,17 +361,23 @@ fn stats_row(ui: &mut egui::Ui, app: &OFGApp) {
     if connected {
         match stats {
             Some(s) => {
-                let iface = app.state.stats_iface.clone().unwrap_or_default();
-                ui.label(
-                    RichText::new(format!(
-                        "↓ {} MB   ↑ {} MB   ↓ {} KB/s   ↑ {} KB/s   ({iface})",
-                        fmt_mb(s.rx_bytes),
-                        fmt_mb(s.tx_bytes),
-                        fmt_kb(s.rx_kbps),
-                        fmt_kb(s.tx_kbps)
-                    ))
-                    .strong(),
-                );
+                ui.horizontal(|ui| {
+                    arrow(ui, egui::Vec2::new(0.0, 1.0), DOWN_BLUE);
+                    ui.label(RichText::new(format!("{} MB", fmt_mb(s.rx_bytes))).strong());
+                    ui.add_space(8.0);
+                    arrow(ui, egui::Vec2::new(0.0, -1.0), UP_GREEN);
+                    ui.label(RichText::new(format!("{} MB", fmt_mb(s.tx_bytes))).strong());
+                    ui.add_space(12.0);
+                    arrow(ui, egui::Vec2::new(0.0, 1.0), DOWN_BLUE);
+                    ui.label(RichText::new(format!("{} KB/s", fmt_kb(s.rx_kbps))));
+                    ui.add_space(8.0);
+                    arrow(ui, egui::Vec2::new(0.0, -1.0), UP_GREEN);
+                    ui.label(RichText::new(format!("{} KB/s", fmt_kb(s.tx_kbps))));
+                    ui.add_space(12.0);
+                    if let Some(iface) = &app.state.stats_iface {
+                        ui.label(RichText::new(format!("({iface})")).weak());
+                    }
+                });
             }
             None => {
                 ui.label("Connected — collecting statistics…");
@@ -336,7 +390,7 @@ fn stats_row(ui: &mut egui::Ui, app: &OFGApp) {
     }
 }
 
-fn log_section(ui: &mut egui::Ui, app: &mut OFGApp) {
+fn log_section(ui: &mut egui::Ui, app: &OFGApp) {
     egui::CollapsingHeader::new("Connection log")
         .default_open(true)
         .show(ui, |ui| {
@@ -344,7 +398,13 @@ fn log_section(ui: &mut egui::Ui, app: &mut OFGApp) {
                 .max_height(160.0)
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    for line in &app.state.log {
+                    let lines: Vec<String> = app
+                        .shared
+                        .log
+                        .lock()
+                        .map(|l| l.iter().cloned().collect())
+                        .unwrap_or_default();
+                    for line in lines {
                         ui.monospace(line);
                     }
                 });

@@ -1,21 +1,22 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
 
+#[derive(Debug)]
 pub enum InstEvent {
     Show,
 }
 
-pub struct Primary {
-    rx: Receiver<InstEvent>,
-    _handle: std::thread::JoinHandle<()>,
-}
+/// Queue of events from the single-instance socket listener. Both the active
+/// window session and the headless tray loop drain it (never concurrently:
+/// the main thread runs either one or the other).
+pub type InstQueue = Arc<Mutex<VecDeque<InstEvent>>>;
 
-impl Primary {
-    pub fn into_events(self) -> Receiver<InstEvent> {
-        self.rx
-    }
+pub struct Primary {
+    pub events: InstQueue,
+    _handle: std::thread::JoinHandle<()>,
 }
 
 /// Become the primary instance or notify the existing one.
@@ -38,27 +39,38 @@ pub fn acquire(sock: &Path) -> Option<Primary> {
 
 fn try_bind(sock: &Path) -> Option<Primary> {
     let listener = UnixListener::bind(sock).ok()?;
-    let (tx, rx) = channel::<InstEvent>();
+    let events: InstQueue = Arc::new(Mutex::new(VecDeque::new()));
+    let queue = Arc::clone(&events);
     let handle = std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut s = stream;
             let mut buf = [0u8; 16];
             if let Ok(n) = s.read(&mut buf) {
                 if n > 0 && buf.starts_with(b"show") {
-                    let _ = tx.send(InstEvent::Show);
+                    if let Ok(mut q) = queue.lock() {
+                        q.push_back(InstEvent::Show);
+                    }
                 }
             }
         }
     });
     Some(Primary {
-        rx,
+        events,
         _handle: handle,
     })
 }
 
 /// Ask the running instance to show its window.
-fn notify(sock: &Path) -> bool {
+pub fn notify(sock: &Path) -> bool {
     UnixStream::connect(sock)
         .and_then(|mut s| s.write_all(b"show"))
         .is_ok()
+}
+
+/// Drain all pending instance events.
+pub fn drain(queue: &InstQueue) -> Vec<InstEvent> {
+    match queue.lock() {
+        Ok(mut q) => q.drain(..).collect(),
+        Err(_) => Vec::new(),
+    }
 }

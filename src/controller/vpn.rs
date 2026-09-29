@@ -1,6 +1,7 @@
 use crate::controller::sudo::SudoProbe;
 use crate::model::profile::Profile;
 use crate::model::state::{ConnPhase, Stats};
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -8,11 +9,23 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+/// Shared, thread-safe queue from controllers to the active UI session.
+pub type EventQueue = Arc<Mutex<VecDeque<UiEvent>>>;
+
+/// Panic-safe push into the event queue.
+pub fn push_event(q: &EventQueue, ev: UiEvent) {
+    let mut q = match q.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    q.push_back(ev);
+}
 
 pub struct ConnectArgs {
     pub profile: Profile,
@@ -37,19 +50,20 @@ pub enum UiEvent {
     VpnExited(i32),
 }
 
-/// Handle used by the view thread. Secrets flow through the command channel
+/// Handle used by the UI session. Secrets flow through the command channel
 /// as `Zeroizing<String>` and are never placed on argv or persisted.
+/// The controller outlives window sessions (owned by `SharedRuntime`).
 pub struct VpnController {
-    cmd_tx: Sender<Cmd>,
+    cmd_tx: std::sync::mpsc::Sender<Cmd>,
     pgid: Arc<AtomicI32>,
 }
 
 impl VpnController {
-    pub fn new(evt_tx: Sender<UiEvent>) -> Self {
+    pub fn new(events: EventQueue) -> Self {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let pgid = Arc::new(AtomicI32::new(0));
         let pg = Arc::clone(&pgid);
-        std::thread::spawn(move || manager(cmd_rx, evt_tx, pg));
+        std::thread::spawn(move || manager(cmd_rx, events, pg));
         Self { cmd_tx, pgid }
     }
 
@@ -98,7 +112,7 @@ fn kill_group(pgid: i32, sig: i32) {
     }
 }
 
-fn manager(rx: Receiver<Cmd>, evt_tx: Sender<UiEvent>, pgid: Arc<AtomicI32>) {
+fn manager(rx: Receiver<Cmd>, events: EventQueue, pgid: Arc<AtomicI32>) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Quit => break,
@@ -107,7 +121,7 @@ fn manager(rx: Receiver<Cmd>, evt_tx: Sender<UiEvent>, pgid: Arc<AtomicI32>) {
                 args.vpn_pass,
                 args.sudo_pass,
                 args.mode,
-                &evt_tx,
+                &events,
                 &pgid,
             ),
         }
@@ -125,13 +139,14 @@ fn run_session(
     vpn_pass: Zeroizing<String>,
     sudo_pass: Option<Zeroizing<String>>,
     mode: SudoProbe,
-    evt_tx: &Sender<UiEvent>,
+    events: &EventQueue,
     pgid: &Arc<AtomicI32>,
 ) {
     let Some(bin) = mode.binary() else {
-        let _ = evt_tx.send(UiEvent::ConnectFailed(
-            "openfortivpn binary is missing.".into(),
-        ));
+        push_event(
+            events,
+            UiEvent::ConnectFailed("openfortivpn binary is missing.".into()),
+        );
         return;
     };
     let passwordless = mode.passwordless();
@@ -139,17 +154,21 @@ fn run_session(
     let conf = match write_temp_config(&profile, &vpn_pass) {
         Ok(c) => c,
         Err(e) => {
-            let _ = evt_tx.send(UiEvent::ConnectFailed(format!(
-                "failed to write temp config: {e}"
-            )));
+            push_event(
+                events,
+                UiEvent::ConnectFailed(format!("failed to write temp config: {e}")),
+            );
             return;
         }
     };
 
-    let _ = evt_tx.send(UiEvent::Log(format!(
-        "Launching: sudo {} --config (temp file, 0600)",
-        bin.display()
-    )));
+    push_event(
+        events,
+        UiEvent::Log(format!(
+            "Launching: sudo {} --config (temp file, 0600)",
+            bin.display()
+        )),
+    );
 
     let mut cmd = Command::new("sudo");
     if !passwordless {
@@ -170,9 +189,10 @@ fn run_session(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = evt_tx.send(UiEvent::ConnectFailed(format!(
-                "failed to launch sudo: {e}"
-            )));
+            push_event(
+                events,
+                UiEvent::ConnectFailed(format!("failed to launch sudo: {e}")),
+            );
             return;
         }
     };
@@ -188,10 +208,10 @@ fn run_session(
 
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let tx_out = evt_tx.clone();
-    let tx_err = evt_tx.clone();
-    let h_out = std::thread::spawn(move || pump(stdout, tx_out));
-    let h_err = std::thread::spawn(move || pump(stderr, tx_err));
+    let ev_out = Arc::clone(events);
+    let ev_err = Arc::clone(events);
+    let h_out = std::thread::spawn(move || pump(stdout, ev_out));
+    let h_err = std::thread::spawn(move || pump(stderr, ev_err));
 
     let status = child.wait();
     pgid.store(0, Ordering::SeqCst);
@@ -205,24 +225,25 @@ fn run_session(
         Ok(s) => {
             let code = s.code().unwrap_or(-1);
             if code == 0 {
-                let _ = evt_tx.send(UiEvent::VpnExited(0));
+                push_event(events, UiEvent::VpnExited(0));
             } else if !info_seen {
                 // openfortivpn never emitted its INFO banner → sudo rejected us.
-                let _ = evt_tx.send(UiEvent::SudoAuthFailed);
+                push_event(events, UiEvent::SudoAuthFailed);
             } else {
-                let _ = evt_tx.send(UiEvent::VpnExited(code));
+                push_event(events, UiEvent::VpnExited(code));
             }
         }
         Err(e) => {
-            let _ = evt_tx.send(UiEvent::ConnectFailed(format!(
-                "failed to wait on sudo: {e}"
-            )));
+            push_event(
+                events,
+                UiEvent::ConnectFailed(format!("failed to wait on sudo: {e}")),
+            );
         }
     }
 }
 
-/// Stream reader → log events + pattern scanning (cert fingerprint, INFO banner).
-fn pump<R: std::io::Read>(reader: R, tx: Sender<UiEvent>) -> ScanFlags {
+/// Stream reader → event queue: log lines + pattern scanning (cert fingerprint, INFO banner).
+fn pump<R: std::io::Read>(reader: R, events: EventQueue) -> ScanFlags {
     let mut flags = ScanFlags::default();
     for line in BufReader::new(reader).lines() {
         match line {
@@ -233,10 +254,10 @@ fn pump<R: std::io::Read>(reader: R, tx: Sender<UiEvent>) -> ScanFlags {
                 if flags.cert.is_none() {
                     if let Some(h) = extract_sha256(&l) {
                         flags.cert = Some(h.clone());
-                        let _ = tx.send(UiEvent::CertUnknown(h));
+                        push_event(&events, UiEvent::CertUnknown(h));
                     }
                 }
-                let _ = tx.send(UiEvent::Log(l));
+                push_event(&events, UiEvent::Log(l));
             }
             Err(_) => break,
         }

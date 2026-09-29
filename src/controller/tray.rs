@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -17,14 +17,21 @@ pub struct TrayIconData {
     pub h: u32,
 }
 
+#[derive(Default)]
+struct TrayCache {
+    variant: Option<TrayVariant>,
+    toggle: Option<bool>,
+    status: Option<String>,
+}
+
+/// Shared tray handle: lives across window sessions, so all mutators take
+/// `&self` and cache state internally to avoid redundant DBus churn.
 pub struct TrayApp {
-    _tray: TrayIcon,
+    tray: TrayIcon,
     item_toggle: MenuItem,
     item_status: MenuItem,
     icons: [TrayIconData; 4],
-    last_variant: Option<TrayVariant>,
-    last_toggle: Option<bool>,
-    last_status: String,
+    cache: Mutex<TrayCache>,
 }
 
 fn decode(png: &[u8], what: &str) -> Result<TrayIconData, String> {
@@ -93,19 +100,21 @@ pub fn init(gtk_ok: bool) -> Result<TrayApp, String> {
         .map_err(|e| e.to_string())?;
 
     Ok(TrayApp {
-        _tray: tray,
+        tray,
         item_toggle: toggle,
         item_status: status,
         icons,
-        last_variant: None,
-        last_toggle: None,
-        last_status: String::new(),
+        cache: Mutex::new(TrayCache::default()),
     })
 }
 
 impl TrayApp {
-    pub fn set_state(&mut self, variant: TrayVariant, tooltip: &str) {
-        if self.last_variant == Some(variant) {
+    pub fn set_state(&self, variant: TrayVariant, tooltip: &str) {
+        let mut cache = match self.cache.lock() {
+            Ok(c) => c,
+            Err(p) => p.into_inner(),
+        };
+        if cache.variant == Some(variant) {
             return;
         }
         let idx = match variant {
@@ -115,24 +124,32 @@ impl TrayApp {
             TrayVariant::Error => 3,
         };
         if let Ok(icon) = make_icon(&self.icons[idx]) {
-            let _ = self._tray.set_icon(Some(icon));
-            let _ = self._tray.set_tooltip(Some(tooltip.to_owned()));
+            let _ = self.tray.set_icon(Some(icon));
+            let _ = self.tray.set_tooltip(Some(tooltip.to_owned()));
         }
-        self.last_variant = Some(variant);
+        cache.variant = Some(variant);
     }
 
-    pub fn set_toggle(&mut self, connected: bool) {
-        if self.last_toggle != Some(connected) {
+    pub fn set_toggle(&self, connected: bool) {
+        let mut cache = match self.cache.lock() {
+            Ok(c) => c,
+            Err(p) => p.into_inner(),
+        };
+        if cache.toggle != Some(connected) {
             self.item_toggle
                 .set_text(if connected { "Disconnect" } else { "Connect" });
-            self.last_toggle = Some(connected);
+            cache.toggle = Some(connected);
         }
     }
 
-    pub fn set_status(&mut self, text: &str) {
-        if self.last_status != text {
+    pub fn set_status(&self, text: &str) {
+        let mut cache = match self.cache.lock() {
+            Ok(c) => c,
+            Err(p) => p.into_inner(),
+        };
+        if cache.status.as_deref() != Some(text) {
             self.item_status.set_text(text);
-            self.last_status = text.to_owned();
+            cache.status = Some(text.to_owned());
         }
     }
 }
