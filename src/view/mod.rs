@@ -11,11 +11,48 @@ use crate::model::state::{fmt_kb, fmt_mb, ConnPhase, UiState};
 use crate::util;
 use crate::util::single_instance::InstEvent;
 use egui::ViewportCommand;
+use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tray_icon::menu::MenuEvent;
 use zeroize::Zeroizing;
+
+/// Timestamped stderr debug line (elapsed ms since process start).
+pub fn dbg_log(msg: &str) {
+    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    let ms = START.elapsed().as_millis();
+    eprintln!("[ofg +{ms}ms] {msg}");
+}
+
+/// Runtime state shared between the UI and the tray/menu world: VPN controller
+/// (outlives everything — it supervises the openfortivpn child), tray, event
+/// queue, persistent log and the single-instance queue.
+/// Single-threaded by design (UI + tray all run on the main thread), hence `Rc`.
+pub struct SharedRuntime {
+    pub paths: util::Paths,
+    pub vpn: VpnController,
+    pub tray: Option<TrayApp>,
+    pub events: crate::controller::EventQueue,
+    pub inst_events: util::single_instance::InstQueue,
+    pub log: Arc<Mutex<VecDeque<String>>>,
+    pub distro_pretty: String,
+    pub distro_cmd: String,
+}
+
+impl SharedRuntime {
+    pub fn push_log(&self, line: String) {
+        let mut log = match self.log.lock() {
+            Ok(l) => l,
+            Err(p) => p.into_inner(),
+        };
+        log.push_back(line);
+        while log.len() > 500 {
+            log.pop_front();
+        }
+    }
+}
 
 pub struct PendingConnect {
     pub profile: Profile,
@@ -23,31 +60,21 @@ pub struct PendingConnect {
 }
 
 pub struct Parts {
+    pub shared: Rc<SharedRuntime>,
     pub book: ProfileBook,
-    pub evt_rx: Receiver<UiEvent>,
-    pub evt_tx: Sender<UiEvent>,
-    pub vpn: VpnController,
-    pub tray: Option<TrayApp>,
-    pub inst_rx: Option<Receiver<InstEvent>>,
-    pub paths: util::Paths,
     pub probe: SudoProbe,
-    pub distro_pretty: String,
-    pub distro_cmd: String,
 }
 
 pub struct OFGApp {
-    pub paths: util::Paths,
+    pub shared: Rc<SharedRuntime>,
     pub book: ProfileBook,
     pub state: UiState,
-    pub evt_tx: Sender<UiEvent>,
-    pub evt_rx: Receiver<UiEvent>,
-    pub vpn: VpnController,
-    pub tray: Option<TrayApp>,
-    pub inst_rx: Option<Receiver<InstEvent>>,
-    pub distro_pretty: String,
-    pub distro_cmd: String,
     pub ctx: Option<egui::Context>,
     pub ticker_started: bool,
+    pub session_started: Instant,
+    pub last_heartbeat: Duration,
+    pub smoke_done: bool,
+    pub on_wayland: bool,
     pub vpn_pass: String,
     pub sudo_buf: String,
     pub sudo_session: Option<Zeroizing<String>>,
@@ -57,6 +84,7 @@ pub struct OFGApp {
     pub quit_confirm: bool,
     pub quitting: bool,
     pub stats_stop: Arc<AtomicBool>,
+    pub connect_hint: Option<String>,
 }
 
 impl OFGApp {
@@ -73,7 +101,8 @@ impl OFGApp {
             ..Default::default()
         };
 
-        // Adopt an openfortivpn session that is already running (external).
+        // Adopt an openfortivpn session that is already running (external or
+        // left over from a previous window session of this very process).
         let stop = Arc::new(AtomicBool::new(false));
         let pids = util::find_pids("openfortivpn");
         let ifaces = util::vpn_ifaces();
@@ -82,25 +111,24 @@ impl OFGApp {
                 pid,
                 iface: iface.clone(),
             };
-            stats::spawn(None, Some(iface), p.evt_tx.clone(), Arc::clone(&stop));
-            state.push_log(format!(
-                "Adopted existing openfortivpn session (pid {pid})."
-            ));
+            stats::spawn(
+                None,
+                Some(iface),
+                Arc::clone(&p.shared.events),
+                Arc::clone(&stop),
+            );
         }
 
-        let mut app = Self {
-            paths: p.paths,
+        let app = Self {
+            shared: p.shared,
             book: p.book,
             state,
-            evt_tx: p.evt_tx,
-            evt_rx: p.evt_rx,
-            vpn: p.vpn,
-            tray: p.tray,
-            inst_rx: p.inst_rx,
-            distro_pretty: p.distro_pretty,
-            distro_cmd: p.distro_cmd,
             ctx: None,
             ticker_started: false,
+            session_started: Instant::now(),
+            last_heartbeat: Duration::ZERO,
+            smoke_done: false,
+            on_wayland: std::env::var_os("WAYLAND_DISPLAY").is_some(),
             vpn_pass: String::new(),
             sudo_buf: String::new(),
             sudo_session: None,
@@ -110,82 +138,102 @@ impl OFGApp {
             quit_confirm: false,
             quitting: false,
             stats_stop: stop,
+            connect_hint: None,
         };
-        app.state.push_log("openfortivpn GUI started.".into());
+        app.push_log("openfortivpn GUI window session started.".into());
         app
     }
 
+    pub fn push_log(&self, line: String) {
+        self.shared.push_log(line);
+    }
+
+    /// Log the event and fire a desktop notification off-thread.
+    fn push_notify(&self, summary: &str, body: String) {
+        self.push_log(format!("[notify] {summary} — {body}"));
+        let summary = summary.to_owned();
+        std::thread::spawn(move || {
+            if let Err(e) = util::notify(&summary, &body) {
+                eprintln!("notification failed: {e}");
+            }
+        });
+    }
+
     fn drain_events(&mut self) {
-        while let Ok(ev) = self.evt_rx.try_recv() {
-            match ev {
-                UiEvent::Log(l) => self.state.push_log(l),
-                UiEvent::Stats { stats, iface } => {
-                    self.state.stats = Some(stats);
-                    self.state.stats_iface = Some(iface);
-                }
-                UiEvent::Phase(ph) => {
-                    if let ConnPhase::Connected { iface } = &ph {
-                        if matches!(self.state.phase, ConnPhase::Connecting) {
-                            let iface = iface.clone();
-                            self.state
-                                .push_log(format!("Connected — interface {iface}."));
-                            self.state.phase = ph;
-                            self.push_notify("VPN connected", format!("Interface {iface}"));
-                        }
+        let incoming: Vec<UiEvent> = match self.shared.events.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => Vec::new(),
+        };
+        for ev in incoming {
+            self.apply_event(ev);
+        }
+    }
+
+    fn apply_event(&mut self, ev: UiEvent) {
+        match ev {
+            UiEvent::Log(l) => self.push_log(l),
+            UiEvent::Stats { stats, iface } => {
+                self.state.stats = Some(stats);
+                self.state.stats_iface = Some(iface);
+            }
+            UiEvent::Phase(ph) => {
+                if let ConnPhase::Connected { iface } = &ph {
+                    if matches!(self.state.phase, ConnPhase::Connecting) {
+                        let iface = iface.clone();
+                        self.push_log(format!("Connected — interface {iface}."));
+                        self.state.phase = ph;
+                        self.push_notify("VPN connected", format!("Interface {iface}"));
                     }
                 }
-                UiEvent::IfaceGone => {
-                    if self.state.phase.connected() {
-                        self.state.push_log("VPN interface disappeared.".into());
+            }
+            UiEvent::IfaceGone => {
+                if self.state.phase.connected() {
+                    self.push_log("VPN interface disappeared.".into());
+                    self.state.phase = ConnPhase::Idle;
+                    self.state.stats = None;
+                    self.state.stats_iface = None;
+                    self.push_notify("VPN disconnected", "The VPN interface disappeared.".into());
+                }
+            }
+            UiEvent::CertUnknown(h) => self.state.unknown_cert = Some(h),
+            UiEvent::SudoAuthFailed => {
+                self.sudo_session = None;
+                self.state.stats = None;
+                self.state.phase = ConnPhase::Failed {
+                    reason: "sudo rejected the password (cached sudo password cleared).".into(),
+                };
+                self.push_notify(
+                    "Connection failed",
+                    "sudo rejected the password (cached sudo password cleared).".into(),
+                );
+            }
+            UiEvent::ConnectFailed(m) => {
+                if matches!(self.state.phase, ConnPhase::Connecting) {
+                    self.stats_stop.store(true, Ordering::SeqCst);
+                    self.shared.vpn.disconnect();
+                    self.state.phase = ConnPhase::Failed { reason: m.clone() };
+                    self.push_notify("Connection failed", m);
+                }
+            }
+            UiEvent::VpnExited(code) => {
+                self.stats_stop.store(true, Ordering::SeqCst);
+                match &self.state.phase {
+                    ConnPhase::Connecting => {
+                        let reason = format!("openfortivpn exited with code {code}.");
+                        self.state.phase = ConnPhase::Failed {
+                            reason: reason.clone(),
+                        };
+                        self.state.stats = None;
+                        self.push_notify("Connection failed", reason);
+                    }
+                    ConnPhase::Connected { .. } | ConnPhase::External { .. } => {
+                        self.push_log("VPN process exited.".into());
                         self.state.phase = ConnPhase::Idle;
                         self.state.stats = None;
                         self.state.stats_iface = None;
-                        self.push_notify(
-                            "VPN disconnected",
-                            "The VPN interface disappeared.".into(),
-                        );
+                        self.push_notify("VPN disconnected", "The VPN process exited.".into());
                     }
-                }
-                UiEvent::CertUnknown(h) => self.state.unknown_cert = Some(h),
-                UiEvent::SudoAuthFailed => {
-                    self.sudo_session = None;
-                    self.state.stats = None;
-                    self.state.phase = ConnPhase::Failed {
-                        reason: "sudo rejected the password (cached sudo password cleared).".into(),
-                    };
-                    self.push_notify(
-                        "Connection failed",
-                        "sudo rejected the password (cached sudo password cleared).".into(),
-                    );
-                }
-                UiEvent::ConnectFailed(m) => {
-                    if matches!(self.state.phase, ConnPhase::Connecting) {
-                        self.stats_stop.store(true, Ordering::SeqCst);
-                        self.vpn.disconnect();
-                        self.state.phase = ConnPhase::Failed { reason: m.clone() };
-                        self.push_notify("Connection failed", m);
-                    }
-                }
-                UiEvent::VpnExited(code) => {
-                    self.stats_stop.store(true, Ordering::SeqCst);
-                    match &self.state.phase {
-                        ConnPhase::Connecting => {
-                            let reason = format!("openfortivpn exited with code {code}.");
-                            self.state.phase = ConnPhase::Failed {
-                                reason: reason.clone(),
-                            };
-                            self.state.stats = None;
-                            self.push_notify("Connection failed", reason);
-                        }
-                        ConnPhase::Connected { .. } | ConnPhase::External { .. } => {
-                            self.state.push_log("VPN process exited.".into());
-                            self.state.phase = ConnPhase::Idle;
-                            self.state.stats = None;
-                            self.state.stats_iface = None;
-                            self.push_notify("VPN disconnected", "The VPN process exited.".into());
-                        }
-                        _ => {}
-                    }
+                    _ => {}
                 }
             }
         }
@@ -203,17 +251,15 @@ impl OFGApp {
     }
 
     fn drain_instance(&mut self) {
-        if let Some(rx) = self.inst_rx.as_ref() {
-            while let Ok(ev) = rx.try_recv() {
-                if matches!(ev, InstEvent::Show) {
-                    self.show_window();
-                }
+        for ev in util::single_instance::drain(&self.shared.inst_events) {
+            if matches!(ev, InstEvent::Show) {
+                self.show_window();
             }
         }
     }
 
     fn sync_tray(&mut self) {
-        let Some(tray) = self.tray.as_mut() else {
+        let Some(tray) = self.shared.tray.as_ref() else {
             return;
         };
         let (variant, tip) = match &self.state.phase {
@@ -248,7 +294,6 @@ impl OFGApp {
 
     pub fn show_window(&self) {
         if let Some(ctx) = &self.ctx {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
     }
@@ -259,9 +304,8 @@ impl OFGApp {
             return;
         }
         if self.vpn_pass.is_empty() {
+            self.connect_hint = Some("Type your VPN password to connect.".into());
             self.show_window();
-            self.state
-                .push_log("Type the VPN password, then Connect.".into());
             return;
         }
         self.on_connect();
@@ -275,11 +319,10 @@ impl OFGApp {
             return;
         };
         if self.vpn_pass.is_empty() {
-            self.show_window();
-            self.state
-                .push_log("Enter the VPN password, then Connect.".into());
+            self.connect_hint = Some("Type your VPN password to connect.".into());
             return;
         }
+        self.connect_hint = None;
         if self.state.passwordless {
             self.do_connect(profile, None);
         } else if let Some(sp) = self.sudo_session.clone() {
@@ -296,6 +339,7 @@ impl OFGApp {
         let Some(mode) = self.current_mode() else {
             return;
         };
+        self.connect_hint = None;
         self.stats_stop.store(true, Ordering::SeqCst);
         self.state.unknown_cert = None;
         self.state.stats = None;
@@ -303,41 +347,34 @@ impl OFGApp {
         self.state.phase = ConnPhase::Connecting;
         let stop = Arc::new(AtomicBool::new(false));
         self.stats_stop = Arc::clone(&stop);
-        self.vpn.connect(
+        self.shared.vpn.connect(
             profile.clone(),
             Zeroizing::new(self.vpn_pass.clone()),
             sudo_pass,
             mode,
         );
-        stats::spawn(profile.interface.clone(), None, self.evt_tx.clone(), stop);
-        self.state.push_log(format!(
+        stats::spawn(
+            profile.interface.clone(),
+            None,
+            Arc::clone(&self.shared.events),
+            stop,
+        );
+        self.push_log(format!(
             "Connecting to {} as {}…",
             profile.server, profile.username
         ));
-    }
-
-    /// Log the event and fire a desktop notification off-thread.
-    fn push_notify(&mut self, summary: &str, body: String) {
-        self.state.push_log(format!("[notify] {summary} — {body}"));
-        let summary = summary.to_owned();
-        std::thread::spawn(move || {
-            if let Err(e) = util::notify(&summary, &body) {
-                eprintln!("notification failed: {e}");
-            }
-        });
     }
 
     pub fn on_disconnect(&mut self) {
         self.stats_stop.store(true, Ordering::SeqCst);
         match self.state.phase.clone() {
             ConnPhase::External { pid, .. } => {
-                self.vpn.kill_external(pid);
-                self.state
-                    .push_log(format!("Terminating external openfortivpn (pid {pid})…"));
+                self.shared.vpn.kill_external(pid);
+                self.push_log(format!("Terminating external openfortivpn (pid {pid})…"));
             }
             ConnPhase::Connecting | ConnPhase::Connected { .. } => {
-                self.vpn.disconnect();
-                self.state.push_log("Disconnect requested…".into());
+                self.shared.vpn.disconnect();
+                self.push_log("Disconnect requested…".into());
             }
             _ => return,
         }
@@ -360,7 +397,7 @@ impl OFGApp {
         if self.state.phase.busy() {
             self.on_disconnect();
         }
-        self.vpn.quit();
+        self.shared.vpn.quit();
         self.quitting = true;
         if let Some(ctx) = self.ctx.clone() {
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -411,7 +448,7 @@ impl OFGApp {
                 self.state.binary_path = Some(b.clone());
             }
         }
-        self.state.push_log(format!(
+        self.push_log(format!(
             "Re-checked: installed={}, passwordless={}",
             self.state.installed, self.state.passwordless
         ));
@@ -421,13 +458,13 @@ impl OFGApp {
         let id = prof.id.clone();
         self.book.upsert(prof);
         self.book.selected = Some(id);
-        self.book.save(&self.paths.book_path).ok();
+        self.book.save(&self.shared.paths.book_path).ok();
     }
 
     pub fn delete_editor(&mut self) {
         if let Some(id) = self.book.selected.clone() {
             self.book.delete(&id);
-            self.book.save(&self.paths.book_path).ok();
+            self.book.save(&self.shared.paths.book_path).ok();
         }
     }
 }
@@ -435,24 +472,71 @@ impl OFGApp {
 impl eframe::App for OFGApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ctx = Some(ctx.clone());
-        // Close-to-tray: intercept the close request unless a real quit was requested.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
         if !self.ticker_started {
             self.ticker_started = true;
             let c = ctx.clone();
             std::thread::spawn(move || loop {
-                c.request_repaint_after(std::time::Duration::from_millis(250));
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                c.request_repaint_after(Duration::from_millis(250));
+                std::thread::sleep(Duration::from_millis(250));
             });
         }
+
+        // Debug/smoke hook (AGENTS.md §14): OFG_SMOKE_CLOSE_MS=<ms> closes the
+        // window session automatically so close-to-tray/reopen can be tested
+        // programmatically.
+        if !self.smoke_done {
+            match std::env::var("OFG_SMOKE_CLOSE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(ms) => {
+                    if self.session_started.elapsed() >= Duration::from_millis(ms) {
+                        self.smoke_done = true;
+                        self.push_log("[smoke] simulating window close".into());
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
+                None => self.smoke_done = true,
+            }
+        }
+
+        // Close (X): hide from screen but keep the app + VPN alive.
+        // X11: real hide (winit unmap/map works). Wayland: winit cannot hide,
+        // unmap, restore or focus a window (set_visible is a no-op,
+        // focus_window is empty, unminimize is ignored) — so we minimize to
+        // the taskbar instead; restoring is done from the taskbar.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.quitting {
+                dbg_log("close_requested → QUIT");
+                // No CancelClose: let eframe tear down and return.
+            } else {
+                dbg_log(if self.on_wayland {
+                    "close_requested → minimize (Wayland)"
+                } else {
+                    "close_requested → hide to tray (X11)"
+                });
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                if self.on_wayland {
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                } else {
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                }
+                self.push_log("Window hidden — openfortivpn-gui keeps running in the tray.".into());
+            }
+        }
+
+        // Heartbeat (stderr, every 2 s) — proves the event loop keeps ticking
+        // (tray menu liveness) even while the window is hidden/minimized.
+        if self.session_started.elapsed() - self.last_heartbeat >= Duration::from_secs(2) {
+            self.last_heartbeat = self.session_started.elapsed();
+            dbg_log("heartbeat");
+        }
+
         self.drain_events();
         self.drain_tray();
         self.drain_instance();
         self.sync_tray();
-        if self.tray.is_some() {
+        if self.shared.tray.is_some() {
             // Pump GTK so libayatana-appindicator delivers menu events/updates.
             gtk::main_iteration_do(false);
         }

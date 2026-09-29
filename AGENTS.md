@@ -24,6 +24,7 @@ sudo openfortivpn vpn2.cetiqt.senai.br:10443 -u joao.araujo --trusted-cert 10ada
 | Tray | **tray-icon 0.19** with `default-features = false` (drops the `libxdo` runtime dep) + muda menus, libayatana-appindicator backend | StatusNotifierItem/DBusMenu → renders on Plasma, XFCE, GNOME w/ AppIndicator extension. GTK main loop is pumped non-blockingly from the egui update loop |
 | Serialization | serde + serde_json | profiles in JSON (user requirement) |
 | Single instance | unix socket in `$XDG_RUNTIME_DIR` | second launch sends "show" and exits |
+| Window close | X11: hide (`Visible(false)`); Wayland: minimize (`Minimized(true)`) | winit 0.30 Wayland backend cannot hide, restore, focus or unminimize a window (`set_visible` is a no-op, `focus_window` is empty, unminimize is ignored) — minimize is the only working close primitive; the event loop keeps ticking while minimized (verified via heartbeat) |
 | Process mgmt | std::process + setsid/pgid | group kill of `sudo openfortivpn` |
 | Sudo password | remembered for the session in RAM (`Zeroizing`), cleared on exit or auth failure | user decision |
 | Crypto on secrets | none stored; zeroize for in-memory passwords | passwords never persisted |
@@ -132,7 +133,7 @@ Path: `$XDG_CONFIG_HOME/openfortivpn-gui/profiles.json`
 
 ## 7. Window & tray behavior
 
-- Close (X) → hide window, keep running in tray. **Minimize** → normal minimize (stays in taskbar). App exits only via tray Exit or About→Quit with confirmation when connected ("Disconnect and exit?").
+- **Close (X)** → X11: window hidden, app in tray; Wayland: window minimized to the taskbar (winit/eframe cannot unmap or restore a Wayland window — restoring is done from the taskbar; the tray stays fully functional either way). **Minimize** → normal minimize. App exits only via tray Exit (confirm when connected: "Disconnect and exit?").
 - System notifications (notify-rust, org.freedesktop.Notifications) fire on: connected (with interface name), manual disconnect, interface disappearance, VPN process exit, and connection failures (sudo rejection, openfortivpn exit). They are fire-and-forget (6 s timeout); failures are logged to stderr, never fatal. No notification on external-session adoption at startup.
 - Tray icon (assets/icon PNG): green overlay when connected, gray idle, yellow while connecting, red missing-binary.
 - Tray menu (dynamic):
@@ -200,12 +201,14 @@ StartupNotify=true
 - One VPN connection at a time; manual reconnect only (no auto-reconnect).
 - OTP/2FA prompts cannot be answered from GUI (no TTY); documented in About/help if hit.
 - GNOME requires the AppIndicator extension for the tray (Plasma/XFCE fine).
+- Wayland: close = minimize-to-taskbar (winit cannot hide/restore Wayland windows); tray `Open` cannot un-minimize — restore via taskbar click. On X11 close = real tray-hide with tray `Open` restore.
 
 ## 14. Verification checklist (every PR touching behavior)
 
 - `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` in container.
 - Unit: profiles serde roundtrip; distro detect; command assembly asserts no secret in argv.
-- Manual smoke: launch → window opens; rename openfortivpn in PATH → red banner + disabled UI; connect real profile → ppp appears, stats grow, tray Status updates; Close → tray only, Open restores; Disconnect kills ppp; Exit quits clean (no leftover pppd, temp config removed).
+- Manual smoke: launch → window opens; rename openfortivpn in PATH → red banner + disabled UI; connect real profile → ppp appears, stats grow, tray Status updates; Close → X11 hidden / Wayland minimized, process alive (check `[ofg] heartbeat` on stderr — proves tray menu liveness); Disconnect kills ppp; Exit quits clean (no leftover pppd, temp config removed).
+- Debug hooks: `OFG_SMOKE_CLOSE_MS=<ms>` simulates the X button after N ms (same code path as a real close) so close behavior can be tested programmatically; `[ofg +Nms]` stderr lines timestamp session transitions and a 2 s heartbeat proving the loop is alive while hidden/minimized.
 
 ## 15. Decisions (resolved 2026-09-29)
 

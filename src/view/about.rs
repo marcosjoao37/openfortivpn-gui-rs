@@ -22,7 +22,10 @@ pub fn show(app: &mut OFGApp, ctx: &egui::Context) {
             ui.label("Built with Rust + egui + tray-icon.");
             ui.label("Developed with AI assistance.");
             ui.add_space(6.0);
-            ui.label(format!("Profiles: {}", app.paths.book_path.display()));
+            ui.label(format!(
+                "Profiles: {}",
+                app.shared.paths.book_path.display()
+            ));
             ui.label("Passwords (VPN and sudo) are never saved to disk.");
             ui.add_space(8.0);
             if ui.button("Close").clicked() {

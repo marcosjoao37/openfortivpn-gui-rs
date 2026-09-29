@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::path::PathBuf;
 
 /// Throughput snapshot; byte totals are per-session (since iface detection).
@@ -58,26 +57,18 @@ pub struct UiState {
     pub phase: ConnPhase,
     pub stats: Option<Stats>,
     pub stats_iface: Option<String>,
-    pub log: VecDeque<String>,
     pub installed: bool,
     pub passwordless: bool,
     pub binary_path: Option<PathBuf>,
     pub unknown_cert: Option<String>,
 }
 
-impl UiState {
-    pub fn push_log(&mut self, line: String) {
-        self.log.push_back(line);
-        while self.log.len() > 500 {
-            self.log.pop_front();
-        }
-    }
-}
-
 pub fn fmt_mb(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / 1_048_576.0)
 }
 
-pub fn fmt_kb(bps: f64) -> String {
-    format!("{:.0}", bps / 1024.0)
+/// Format a throughput value already expressed in KB/s.
+/// (Regression guard: the sampler emits KB/s — never divide again here.)
+pub fn fmt_kb(kbps: f64) -> String {
+    format!("{:.0}", kbps)
 }

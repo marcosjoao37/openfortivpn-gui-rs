@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// XDG-backed app paths.
+#[derive(Clone)]
 pub struct Paths {
     pub config_dir: PathBuf,
     pub book_path: PathBuf,

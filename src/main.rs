@@ -1,46 +1,31 @@
 use openfortivpn_gui::controller::sudo;
 use openfortivpn_gui::controller::tray;
-use openfortivpn_gui::controller::vpn::{UiEvent, VpnController};
+use openfortivpn_gui::controller::vpn::VpnController;
 use openfortivpn_gui::model::distro;
 use openfortivpn_gui::model::profile::ProfileBook;
 use openfortivpn_gui::util;
 use openfortivpn_gui::util::single_instance;
-use openfortivpn_gui::view::{OFGApp, Parts};
-use std::sync::mpsc::channel;
+use openfortivpn_gui::view::{OFGApp, Parts, SharedRuntime};
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 fn main() -> eframe::Result<()> {
     let paths = util::paths();
 
     // Single instance: second launch asks the first one to show its window.
-    let inst_rx = match single_instance::acquire(&paths.sock) {
-        Some(primary) => Some(primary.into_events()),
-        None => {
-            eprintln!("openfortivpn-gui is already running — asked it to show its window.");
-            return Ok(());
-        }
+    let Some(primary) = single_instance::acquire(&paths.sock) else {
+        eprintln!("openfortivpn-gui is already running — asked it to show its window.");
+        return Ok(());
     };
 
     let gtk_ok = gtk::init().is_ok();
+    let tray = tray::init(gtk_ok).ok();
 
     std::fs::create_dir_all(&paths.config_dir).ok();
-    let mut book = match ProfileBook::load(&paths.book_path) {
-        Ok(Some(b)) => b,
-        Ok(None) => ProfileBook::seed_default(),
-        Err(e) => {
-            eprintln!("profiles.json unreadable ({e}); starting fresh");
-            ProfileBook::seed_default()
-        }
-    };
-    if book.selected.is_none() {
-        book.selected = book.profiles.first().map(|p| p.id.clone());
-    }
-    book.save(&paths.book_path).ok();
 
-    let probe = sudo::probe();
-
-    let (evt_tx, evt_rx) = channel::<UiEvent>();
-    let vpn = VpnController::new(evt_tx.clone());
-    let tray = tray::init(gtk_ok).ok();
+    let events = Arc::new(Mutex::new(VecDeque::new()));
+    let vpn = VpnController::new(Arc::clone(&events));
 
     let os = distro::detect();
     let distro_pretty = os
@@ -52,18 +37,26 @@ fn main() -> eframe::Result<()> {
         .map(|d| d.install_cmd.to_string())
         .unwrap_or_else(|| distro::install_command("", "").to_string());
 
-    let parts = Parts {
-        book,
-        evt_rx,
-        evt_tx,
+    let shared = Rc::new(SharedRuntime {
+        paths: paths.clone(),
         vpn,
         tray,
-        inst_rx,
-        paths,
-        probe,
+        events,
+        inst_events: primary.events,
+        log: Arc::new(Mutex::new(VecDeque::new())),
         distro_pretty,
         distro_cmd,
+    });
+    shared.push_log("openfortivpn GUI started.".into());
+
+    let book = match ProfileBook::load(&paths.book_path) {
+        Ok(Some(b)) => b,
+        Ok(None) | Err(_) => ProfileBook::seed_default(),
     };
+    let mut book = book;
+    if book.selected.is_none() {
+        book.selected = book.profiles.first().map(|p| p.id.clone());
+    }
 
     let icon = util::icon_data(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -79,9 +72,23 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let parts = Parts {
+        shared: Rc::clone(&shared),
+        book,
+        probe: sudo::probe(),
+    };
+
+    let result = eframe::run_native(
         "openfortivpn GUI",
         options,
         Box::new(move |cc| Ok(Box::new(OFGApp::new(cc, parts)))),
-    )
+    );
+
+    // Cleanup: tear down any VPN session this process started or adopted.
+    if let Some(pid) = util::find_pids("openfortivpn").first() {
+        shared.vpn.kill_external(*pid);
+    }
+    shared.vpn.disconnect();
+    shared.vpn.quit();
+    result
 }

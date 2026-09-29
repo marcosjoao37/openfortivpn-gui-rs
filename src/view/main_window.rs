@@ -50,10 +50,10 @@ fn banner(ui: &mut egui::Ui, app: &mut OFGApp) {
                                 .color(WHITE),
                         );
                         ui.label(
-                            RichText::new(format!("Detected distro: {}", app.distro_pretty))
+                            RichText::new(format!("Detected distro: {}", app.shared.distro_pretty))
                                 .color(WHITE),
                         );
-                        copy_row(ui, "Install command", app.distro_cmd.clone());
+                        copy_row(ui, "Install command", app.shared.distro_cmd.clone());
                         ui.add_space(4.0);
                         sudoers_tip(ui, app, WHITE);
                     });
@@ -95,9 +95,9 @@ fn banner(ui: &mut egui::Ui, app: &mut OFGApp) {
                             prof.trust_cert = true;
                             prof.trusted_cert = sha.to_lowercase();
                             app.book.upsert(prof);
-                            app.book.save(&app.paths.book_path).ok();
+                            app.book.save(&app.shared.paths.book_path).ok();
                             app.state.unknown_cert = None;
-                            app.state.push_log(
+                            app.push_log(
                                 "Certificate trusted and saved to the profile. Reconnect to apply."
                                     .into(),
                             );
@@ -160,7 +160,7 @@ fn profile_bar(ui: &mut egui::Ui, app: &mut OFGApp) {
                 });
             if sel != app.book.selected {
                 app.book.selected = sel;
-                app.book.save(&app.paths.book_path).ok();
+                app.book.save(&app.shared.paths.book_path).ok();
             }
         } else {
             let mut cur = current;
@@ -222,12 +222,15 @@ fn fields(ui: &mut egui::Ui, app: &mut OFGApp) {
             ui.end_row();
 
             ui.label("VPN password:");
-            ui.add_enabled(
+            let resp = ui.add_enabled(
                 can_edit_password,
                 TextEdit::singleline(&mut app.vpn_pass)
                     .password(true)
                     .desired_width(340.0),
             );
+            if resp.changed() && !app.vpn_pass.is_empty() {
+                app.connect_hint = None;
+            }
             ui.end_row();
 
             ui.label("Trust certificate:");
@@ -254,9 +257,10 @@ fn fields(ui: &mut egui::Ui, app: &mut OFGApp) {
 
 fn action_row(ui: &mut egui::Ui, app: &mut OFGApp) {
     ui.horizontal(|ui| {
+        // Connect stays enabled even with an empty password; clicking it
+        // shows an inline hint instead of silently doing nothing.
         let can_connect = app.state.installed
             && matches!(app.state.phase, ConnPhase::Idle | ConnPhase::Failed { .. })
-            && !app.vpn_pass.is_empty()
             && app.book.selected_profile().is_some();
         let can_disconnect = app.state.phase.busy();
         if ui
@@ -278,6 +282,9 @@ fn action_row(ui: &mut egui::Ui, app: &mut OFGApp) {
         ui.label(RichText::new(dot).size(14.0).color(color));
         ui.label(txt);
     });
+    if let Some(hint) = &app.connect_hint {
+        ui.label(RichText::new(hint).color(ERR_FG));
+    }
     if let ConnPhase::Failed { reason } = &app.state.phase {
         ui.label(RichText::new(reason).color(ERR_FG));
     }
@@ -336,7 +343,7 @@ fn stats_row(ui: &mut egui::Ui, app: &OFGApp) {
     }
 }
 
-fn log_section(ui: &mut egui::Ui, app: &mut OFGApp) {
+fn log_section(ui: &mut egui::Ui, app: &OFGApp) {
     egui::CollapsingHeader::new("Connection log")
         .default_open(true)
         .show(ui, |ui| {
@@ -344,7 +351,13 @@ fn log_section(ui: &mut egui::Ui, app: &mut OFGApp) {
                 .max_height(160.0)
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    for line in &app.state.log {
+                    let lines: Vec<String> = app
+                        .shared
+                        .log
+                        .lock()
+                        .map(|l| l.iter().cloned().collect())
+                        .unwrap_or_default();
+                    for line in lines {
                         ui.monospace(line);
                     }
                 });
