@@ -2,7 +2,7 @@
 
 > **⚠ Developed with AI assistance.** This project was built end-to-end by an AI coding agent (architecture, code, tests, packaging) with human review. Disclosed up front, as required by good sense and the GPL.
 
-Linux desktop GUI for [`openfortivpn`](https://github.com/adrienverge/openfortivpn). Fortinet SSL VPN with a tray icon, profiles, and **no terminal**.
+Linux desktop GUI for [`openfortivpn`](https://github.com/adrienverge/openfortivpn). Fortinet SSL VPN with a tray icon, profiles and no terminal required.
 
 - **License:** GPL-3.0-or-later (see [`LICENSE`](LICENSE))
 - **Platform:** Linux only — hard dependency on the `openfortivpn` binary
@@ -63,8 +63,6 @@ Layout is strict MVC — see [`AGENTS.md`](AGENTS.md) for the boundary rules (`v
 
 - `main` — stable
 - `development` — work happens here
-- remote: `git@github.com:marcosjoao37/openfortivpn-gui-rs.git`
-- maintainer: João Marcos Silva e Araújo — [github.com/marcosjoao37](https://github.com/marcosjoao37)
 
 ## License
 
